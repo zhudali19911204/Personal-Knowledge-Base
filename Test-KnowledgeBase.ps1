@@ -309,11 +309,11 @@ const obsidianRelations = helpers.renderMarkdownSource(
   "Source: [[06_Archive/Sources/AI Dialogues/0601_2026/2026-08-21 1529 - M100.2 Rule|M100.2 source]]\nIndex: [[02_FICO/0203_Transfer Price/_Index|FICO Transfer Price]]",
   "02_FICO/0203_Transfer Price/Current.md",
 );
-if (!obsidianRelations.includes("[M100.2 source](</06_Archive/Sources/AI Dialogues/0601_2026/2026-08-21 1529 - M100.2 Rule.md>)")) {
-  throw new Error(`An Obsidian source link was not rewritten for the built-in reader: ${obsidianRelations}`);
+if (!obsidianRelations.includes("[[06_Archive/Sources/AI Dialogues/0601_2026/2026-08-21 1529 - M100.2 Rule|M100.2 source]]")) {
+  throw new Error(`An Obsidian source link must remain literal for the DOM post-processing pass: ${obsidianRelations}`);
 }
-if (!obsidianRelations.includes("[FICO Transfer Price](</02_FICO/0203_Transfer Price/_Index.md>)")) {
-  throw new Error(`An Obsidian index link was not rewritten for the built-in reader: ${obsidianRelations}`);
+if (!obsidianRelations.includes("[[02_FICO/0203_Transfer Price/_Index|FICO Transfer Price]]")) {
+  throw new Error(`An Obsidian index link must remain literal for the DOM post-processing pass: ${obsidianRelations}`);
 }
 const relativeRelation = helpers.normalizeObsidianDocumentLink(
   "02_FICO/0203_Transfer Price/Current.md",

@@ -27,6 +27,7 @@ window.__ModuleLoader__.load({
     let pendingGraphSettings = null;
     let graphSettingsSavePromise = null;
     let activeReaderDocument = null;
+    let vaultTitleIndex = null;
     const DOCUMENT_TITLE = "Knowledge Vault";
     const STYLE_ID = "@knowledge-vault/dsh-bootstrap/client.css";
     const css = `
@@ -347,7 +348,13 @@ window.__ModuleLoader__.load({
           return line;
         }
         if (fence) return line;
-        return rewriteObsidianDocumentLinkLine(rewriteMarkdownImageLine(line, documentPath), documentPath);
+        // Document links ([[...]]) are left literal here on purpose: the DOM
+        // post-processing pass (upgradeMalformedVaultMarkdownLinks) resolves them
+        // into <a data-knowledge-vault-path> anchors — the same mechanism the
+        // "related" frontmatter links use. Baking them into markdown at this stage
+        // is unreliable because the markdown renderer can sanitize destinations
+        // that contain spaces or non-ASCII characters. Only images are rewritten.
+        return rewriteMarkdownImageLine(line, documentPath);
       });
     }
 
@@ -413,7 +420,102 @@ window.__ModuleLoader__.load({
 
       const fallbackLabel = targetPath.split("/").pop()?.replace(/\.md$/i, "") || targetPath;
       const label = aliasParts.join("|").trim() || fallbackLabel;
+
+      const bareTitle = !markdownPath.includes("/");
+      if (vaultTitleIndex?.ready) {
+        // The resolved path may not exist in the Vault: either a bare title that is
+        // not a sibling file, or a stale index path. Fall back to title resolution
+        // (target first, then the alias label) so citations and index links land on
+        // the real document instead of a dead link.
+        if (!vaultTitleIndex.byPath.has(path.toLowerCase())) {
+          const titlePath = resolveVaultReference(targetPath) || resolveVaultReference(label);
+          if (titlePath) return { label, requestedPath: `/${titlePath}`, path: titlePath };
+          if (bareTitle) return null;
+        }
+      } else if (bareTitle) {
+        // Title index is not ready yet: keep the bare [[标题]] literal so the DOM
+        // post-processing pass can resolve it once the index has loaded, instead of
+        // baking a dead sibling-relative path into the rendered markdown.
+        return null;
+      }
+
       return { label, requestedPath, path };
+    }
+
+    function buildVaultTitleIndex(graph) {
+      const byTitle = new Map();
+      const byStem = new Map();
+      const byPath = new Map();
+      for (const node of graph?.nodes || []) {
+        const path = String(node?.path || "").replaceAll("\\", "/");
+        if (!path) continue;
+        const withMd = /\.md$/i.test(path) ? path : `${path}.md`;
+        byPath.set(withMd.toLowerCase(), withMd);
+        byPath.set(withMd.toLowerCase().replace(/\.md$/i, ""), withMd);
+        const title = String(node?.title || "").trim();
+        if (title) {
+          const key = title.toLowerCase();
+          const entries = byTitle.get(key) || [];
+          entries.push({ path: withMd, isIndex: Boolean(node?.isIndex) });
+          byTitle.set(key, entries);
+        }
+        const stem = (withMd.split("/").pop() || "").replace(/\.md$/i, "").toLowerCase();
+        if (stem) {
+          const entries = byStem.get(stem) || [];
+          if (!entries.includes(withMd)) entries.push(withMd);
+          byStem.set(stem, entries);
+        }
+      }
+      return { byTitle, byStem, byPath, ready: true };
+    }
+
+    async function loadVaultTitleIndex(refresh = false) {
+      try {
+        vaultTitleIndex = buildVaultTitleIndex(await getGraph(refresh));
+      } catch {
+        vaultTitleIndex = { byTitle: new Map(), byStem: new Map(), byPath: new Map(), ready: false };
+      }
+    }
+
+    function normalizeVaultReference(raw) {
+      let reference = String(raw || "").trim();
+      if (!reference || reference.includes("\0")) return "";
+      const wiki = reference.match(/^\[\[([\s\S]*?)\]\]$/);
+      if (wiki) reference = wiki[1];
+      reference = reference.split("|")[0].split("#")[0].split("^")[0].trim();
+      try {
+        reference = decodeURIComponent(reference);
+      } catch {
+        // Keep literal percent characters from valid Vault filenames.
+      }
+      return reference.replaceAll("\\", "/").replace(/^\/+/, "");
+    }
+
+    function resolveVaultReference(raw, options = {}) {
+      if (!vaultTitleIndex?.ready) return "";
+      const reference = normalizeVaultReference(raw);
+      if (!reference) return "";
+      const { byTitle, byStem, byPath } = vaultTitleIndex;
+
+      if (reference.includes("/")) {
+        const lower = reference.toLowerCase();
+        return byPath.get(lower) || (lower.endsWith(".md") ? "" : byPath.get(`${lower}.md`) || "");
+      }
+
+      const key = reference.toLowerCase();
+      const titles = byTitle.get(key) || [];
+      if (titles.length > 0) {
+        if (options.preferIndex) {
+          const index = titles.find((entry) => entry.isIndex);
+          if (index) return index.path;
+        }
+        if (titles.length === 1) return titles[0].path;
+        const onlyIndex = titles.find((entry) => entry.isIndex);
+        if (onlyIndex) return onlyIndex.path;
+        return "";
+      }
+      const stems = byStem.get(key) || [];
+      return stems.length === 1 ? stems[0] : "";
     }
 
     function markdownLinkLabel(value) {
@@ -505,6 +607,93 @@ window.__ModuleLoader__.load({
       return matches;
     }
 
+    function extractCitationTitle(raw) {
+      let title = String(raw || "").trim();
+      const wiki = title.match(/^\[\[([\s\S]*?)\]\]$/);
+      if (wiki) title = wiki[1];
+      return title.split("|")[0].split("#")[0].split("^")[0].trim();
+    }
+
+    function extractSourceNoteTitle(text) {
+      const match = String(text || "").match(/来源笔记[：:]\s*(?:\[\[([^\]\r\n]+)\]\]|([^\r\n，,、;；]+))/);
+      if (!match) return "";
+      return extractCitationTitle(match[1] || match[2] || "");
+    }
+
+    function splitReferenceTitles(value) {
+      return String(value || "").split(/[、，,；;]/).map((part) => part.trim()).filter(Boolean);
+    }
+
+    function citationLink(valueStart, offset, title, path) {
+      return {
+        index: valueStart + offset,
+        length: title.length,
+        label: title,
+        requestedPath: `/${path}`,
+        path,
+      };
+    }
+
+    function findSourceAssociationLinks(text, sourceNotePath) {
+      const source = String(text || "");
+      if (!/来源笔记|来源片段|所属索引|相关知识/.test(source)) return [];
+      const links = [];
+      const linePattern = /(来源笔记|来源片段|所属索引|相关知识)[：:]\s*([^\r\n]*)/g;
+      let match;
+      while ((match = linePattern.exec(source)) !== null) {
+        const field = match[1];
+        const rawValue = match[2] || "";
+        if (rawValue.includes("[[") || /\[[^\]]*\]\([^)]*\)/.test(rawValue)) continue;
+        const valueStart = match.index + match[0].length - rawValue.length;
+
+        if (field === "来源笔记") {
+          const title = extractCitationTitle(rawValue);
+          const path = title ? resolveVaultReference(title) : "";
+          if (path) links.push(citationLink(valueStart, rawValue.indexOf(title), title, path));
+        } else if (field === "来源片段") {
+          if (!sourceNotePath) continue;
+          const tokenPattern = /S\d+/g;
+          let token;
+          while ((token = tokenPattern.exec(rawValue)) !== null) {
+            links.push(citationLink(valueStart, token.index, token[0], sourceNotePath));
+          }
+        } else if (field === "所属索引") {
+          const title = extractCitationTitle(rawValue);
+          const path = title ? resolveVaultReference(title, { preferIndex: true }) : "";
+          if (path) links.push(citationLink(valueStart, rawValue.indexOf(title), title, path));
+        } else if (field === "相关知识") {
+          for (const part of splitReferenceTitles(rawValue)) {
+            const title = extractCitationTitle(part);
+            const path = title ? resolveVaultReference(title) : "";
+            if (!path) continue;
+            const offset = rawValue.indexOf(part);
+            if (offset >= 0) links.push(citationLink(valueStart, offset, title, path));
+          }
+        }
+      }
+      return links.sort((left, right) => left.index - right.index);
+    }
+
+    function sourceNotePathForTextNode(node, text) {
+      const localTitle = extractSourceNoteTitle(text);
+      if (localTitle) {
+        const path = resolveVaultReference(localTitle);
+        if (path) return path;
+      }
+      let sibling = node?.parentElement?.previousElementSibling;
+      let guard = 0;
+      while (sibling && guard < 8) {
+        const title = extractSourceNoteTitle(sibling.textContent || "");
+        if (title) {
+          const path = resolveVaultReference(title);
+          if (path) return path;
+        }
+        sibling = sibling.previousElementSibling;
+        guard += 1;
+      }
+      return "";
+    }
+
     function upgradeMalformedVaultMarkdownLinks(root) {
       if (!root) return 0;
       const ownerDocument = root.ownerDocument || document;
@@ -521,13 +710,17 @@ window.__ModuleLoader__.load({
       for (const node of textNodes) {
         const parent = node.parentElement;
         const text = String(node.nodeValue || "");
-        if (!parent || (!text.includes(".md)") && !text.includes("[["))) continue;
+        if (!parent) continue;
+        const hasCitation = /来源笔记|来源片段|所属索引|相关知识/.test(text);
+        if (!text.includes(".md)") && !text.includes("[[") && !hasCitation) continue;
         if (parent.closest("a,code,pre,script,style,textarea,[contenteditable=\"true\"]")) continue;
         if (parent.closest('[data-streaming="true"]')) continue;
         const documentPath = parent.closest("[data-vault-document-path]")?.getAttribute("data-vault-document-path") || "";
+        const sourceNotePath = text.includes("来源片段") ? sourceNotePathForTextNode(node, text) : "";
         const links = [
           ...findMalformedVaultMarkdownLinks(text, documentPath),
           ...findObsidianVaultDocumentLinks(text, documentPath),
+          ...findSourceAssociationLinks(text, sourceNotePath),
         ].sort((left, right) => left.index - right.index);
         if (links.length === 0) continue;
 
@@ -2347,6 +2540,30 @@ window.__ModuleLoader__.load({
           document.removeEventListener("click", openVaultMarkdownLink, true);
         };
       }, "knowledge-vault-bootstrap: open Vault Markdown links in reader");
+      ctx.effect(() => {
+        if (typeof document === "undefined" || typeof fetch !== "function") return () => {};
+        let disposed = false;
+        let retryTimer = 0;
+        const refresh = async (refreshGraph = false) => {
+          await loadVaultTitleIndex(refreshGraph);
+          if (disposed) return;
+          upgradeMalformedVaultMarkdownLinks(document.body || document.documentElement);
+          if (!vaultTitleIndex?.ready) {
+            // The graph may not be available yet (for example while the workspace is
+            // still being restored). Retry until the title index resolves, so links
+            // that were left as bare [[标题]] eventually become clickable.
+            retryTimer = window.setTimeout(() => void refresh(false), 1500);
+          }
+        };
+        void refresh(false);
+        const onVaultChanged = () => void refresh(true);
+        window.addEventListener("knowledge-vault:changed", onVaultChanged);
+        return () => {
+          disposed = true;
+          window.clearTimeout(retryTimer);
+          window.removeEventListener("knowledge-vault:changed", onVaultChanged);
+        };
+      }, "knowledge-vault-bootstrap: resolve Vault titles for citations");
       ctx.effect(() => {
         if (typeof document === "undefined") return () => {};
         const originalTitle = document.title;
